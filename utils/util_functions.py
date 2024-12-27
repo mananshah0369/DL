@@ -372,7 +372,7 @@ class RNN(utils.Module):
   def __init__(self, num_inputs, num_hiddens, sigma=0.1):
     super().__init__()
     self.save_hyperparameters()
-    self.rnn = tf.keras.layers.SimpleRNN(units=num_hiddens, return_sequences=True, return_state=True, time_major=True)
+    self.rnn = tf.keras.layers.SimpleRNN(units=num_hiddens, return_sequences=True, return_state=True)
 
   def forward(self, X, state=None):
     """
@@ -453,25 +453,8 @@ class DeepRNN(utils.RNN):
   def __init__(self, num_hiddens, num_layers, dropout=0):
     utils.Module.__init__(self)
     self.save_hyperparameters()
-    gru_cells = [tf.keras.layers.GRUCell(num_hiddens, dropout=dropout) for _ in range(num_layers)]
-    self.rnn = tf.keras.layers.RNN(gru_cells, return_sequences=True, return_state=True, time_major=True)
-
-  def forward(self, X, state=None):
-    ## Output (batch_size, timesteps, output_size), [(batch_size, output_size)]
-    outputs, *state = self.rnn(X, state)
-    return outputs, state
-  
-class GRU(utils.RNN):
-  """The multilayer GRU model.
-
-  Defined in :numref:`sec_deep_rnn`"""
-  def __init__(self, num_hiddens, num_layers, dropout=0):
-    utils.Module.__init__(self)
-    self.save_hyperparameters()
-    gru_cells = [tf.keras.layers.GRUCell(num_hiddens, dropout=dropout)
-                  for _ in range(num_layers)]
-    self.rnn = tf.keras.layers.RNN(gru_cells, return_sequences=True,
-                                    return_state=True, time_major=True)
+    gru_cells = tf.keras.layers.StackedRNNCells([tf.keras.layers.GRUCell(units=num_hiddens, dropout=dropout) for _ in range(num_layers)])
+    self.rnn = tf.keras.layers.RNN(gru_cells, return_sequences=True, return_state=True)
 
   def forward(self, X, state=None):
     ## Output (batch_size, timesteps, output_size), [(batch_size, output_size)]
@@ -754,17 +737,17 @@ class DotProductAttention(tf.keras.layers.Layer):
   def call(self, queries, keys, values, valid_lens=None, **kwargs):
     """
     Queries: Decoder Input: (batch_size, num_queries_per_sample, dims)
-    Keys: Encoder Hidden States: (batch_size, num_keys, dims)           ## (num_keys = num_steps)
+    Keys: Encoder Hidden States:   (batch_size, num_keys, dims)         ## (num_keys = num_steps)
     Values: Encoder Hidden States: (batch_size, num_keys, dims)         ## (num_keys = num_steps)
     Valid Lens: (batch_size, ) OR (batch_size, num_queries_per_sample)  
     """
     dims = queries.shape[-1]
     scores = tf.matmul(a=queries, b=keys, transpose_b=True)/tf.math.sqrt(x=tf.cast(dims, dtype=tf.float32))
     ## (batch_size, num_queries, num_keys)
-    self.attention_weigts = masked_softmax(X=scores, valid_lens=valid_lens)
+    self.attention_weights = masked_softmax(X=scores, valid_lens=valid_lens)
     ## (batch_size, num_queries, num_keys)
 
-    weights = self.dropout(self.attention_weigts, **kwargs) 
+    weights = self.dropout(self.attention_weights, **kwargs) 
     ## (batch_size, num_queries, num_keys)
 
     ## (batch_size, num_queries, dims)
@@ -797,11 +780,107 @@ class AdditiveAttention(tf.keras.layers.Layer):
     scores = tf.squeeze(self.w_v(features), axis=-1)
     ## (batch_size, num_queries, num_keys)
     
-    self.attention_weigts = masked_softmax(X=scores, valid_lens=valid_lens)
+    self.attention_weights = masked_softmax(X=scores, valid_lens=valid_lens)
     ## (batch_size, num_queries, num_keys)
 
-    weights = self.dropout(self.attention_weigts, **kwargs) 
+    weights = self.dropout(self.attention_weights, **kwargs) 
     ## (batch_size, num_queries, num_keys)
 
     ## (batch_size, num_queries, dims)
     return tf.matmul(weights, values) 
+
+class MultiHeadAttention(utils.Module):
+  def  __init__(self, key_dims, query_dims, value_dims, num_hiddens, num_heads, dropout, bias=False, **kwargs):
+    super().__init__()
+    self.num_heads = num_heads
+    self.save_hyperparameters()
+    self.attention = utils.DotProductAttention(dropout=dropout)
+    self.W_q = tf.keras.layers.Dense(units=num_hiddens, use_bias=bias)
+    self.W_k = tf.keras.layers.Dense(units=num_hiddens, use_bias=bias)
+    self.W_v = tf.keras.layers.Dense(units=num_hiddens, use_bias=bias)
+    self.W_o = tf.keras.layers.Dense(units=num_hiddens, use_bias=bias)    
+
+  def call(self, queries, keys, values, valid_lens, **kwargs):
+    queries = self.W_q(queries) ## (batch_size, num_queries_per_sample, num_hiddens)
+    keys = self.W_k(keys)       ## (batch_size, num_keys, num_hiddens)
+    values = self.W_v(values)   ## (batch_size, num_values, num_hiddens)
+
+    batch_size = queries.shape[0]
+    last_dims = self.num_hiddens // self.num_heads
+
+    ## Redo
+    queries = self.transpose(queries)
+    keys = self.transpose(keys)
+    values =  self.transpose(values)
+
+    if valid_lens is not None:
+      valid_lens = tf.repeat(valid_lens, repeats=self.num_heads, axis=0)
+
+    output = self.attention(queries, keys, values, valid_lens)
+    ## (batch_size * num_heads, num_queries_per_sample, last_dims)
+
+    output = self.reverse_transpose(output)
+    return self.W_o(output)
+  
+  def transpose(self, X):
+    ## X: (batch_size, num_queries/keys/values, num_hiddens)
+    batch_size, num_qkv, num_hiddens = X.shape
+    
+    X = tf.reshape(X, shape=(batch_size, num_qkv, self.num_heads, -1))
+    ## (batch_size, num_queries/keys/values, num_heads, num_hiddens//num_heads)
+    
+    X = tf.transpose(X, perm=[0, 2, 1, 3])
+    ## (batch_size, num_heads, num_queries/keys/values, num_hiddens//num_heads)
+
+    X = tf.reshape(X, shape=(-1, num_qkv, num_hiddens // self.num_heads))
+    ## (batch_size * num_heads, num_queries/keys/values, num_hiddens//num_heads)
+
+    return X
+  
+  def reverse_transpose(self, X):
+    ## X: (batch_size*num_heads, num_queries/keys/values, num_hiddens//num_heads)
+    batch_size_times_num_heads, num_qkv, num_hiddens_per_num_heads = X.shape
+    
+    batch_size = batch_size_times_num_heads // self.num_heads
+    X  = tf.reshape(X, shape=(batch_size, self.num_heads, num_qkv, num_hiddens_per_num_heads))
+    
+    X = tf.transpose(X, perm=[0, 2, 1, 3])
+    ## (batch_size, num_queries/keys/values, num_heads, num_hiddens//num_heads)
+
+    X = tf.reshape(X, shape=(batch_size, num_qkv, self.num_hiddens))
+    ## (batch_size, num_queries/keys/values, num_hiddens)
+
+    return X
+  
+class PositionWiseFFN(tf.keras.layers.Layer):
+  def __init__(self, ffn_num_hiddens, ffn_num_outputs):
+    super().__init__()
+    self.dense1 = tf.keras.layers.Dense(units=ffn_num_hiddens)
+    self.relu = tf.keras.layers.ReLU()
+    self.dense2 = tf.keras.layers.Dense(units=ffn_num_outputs)
+
+  def call(self, X):
+    return self.dense2(self.relu(self.dense1(X)))
+  
+class AddNorm(tf.keras.layers.Layer):
+  """Residual Connection followed by layer normalization
+     Normalization Shape: Shape of X excluding the first dimension (batch_size)
+  """
+  def __init__(self, norm_shape, dropout):
+    super().__init__()
+    self.dropout = tf.keras.layers.Dropout(dropout)
+    self.ln = tf.keras.layers.LayerNormalization(axis=norm_shape)
+
+  def call(self, X, Y, **kwargs):
+    return self.ln(self.dropout(Y, **kwargs) + X)
+  
+class AttentionDecoder(utils.Decoder):
+    """The base attention-based decoder interface.
+
+    Defined in :numref:`sec_seq2seq_attention`"""
+    def __init__(self):
+        super().__init__()
+
+    @property
+    def attention_weights(self):
+        raise NotImplementedError
